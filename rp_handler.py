@@ -93,7 +93,7 @@ def _enhance_video(input_path, output_path):
         if not ret:
             break
         _, _, enhanced = restorer.enhance(
-            frame, has_aligned=True, only_center_face=True, paste_back=True
+            frame, has_aligned=False, only_center_face=True, paste_back=True
         )
         writer.write(enhanced)
         count += 1
