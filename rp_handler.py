@@ -9,7 +9,6 @@ from botocore.exceptions import BotoCoreError, ClientError
 MODEL_DIR = "/app/LatentSync"
 CKPT = os.path.join(MODEL_DIR, "checkpoints", "latentsync_unet.pt")
 UNET_CFG = os.path.join(MODEL_DIR, "configs", "unet", "stage2_512.yaml")  # 1.6 (512x512)
-GFPGAN_MODEL = "/app/models/gfpgan/GFPGANv1.4.pth"
 
 # --- Cloudflare R2 (S3-compatible) ---
 R2_ENDPOINT = os.getenv("BUCKET_ENDPOINT_URL")
@@ -63,64 +62,6 @@ def _upload_to_r2(file_path: str):
         raise RuntimeError(f"R2 upload failed: {e}")
 
 
-def _enhance_video(input_path, output_path):
-    """Post-process video with GFPGAN face restoration (512x512 aligned face)."""
-    import cv2
-    import torch
-    import sys
-    import torchvision.transforms.functional as F
-    sys.modules['torchvision.transforms.functional_tensor'] = F
-    from gfpgan import GFPGANer
-
-    restorer = GFPGANer(
-        model_path=GFPGAN_MODEL,
-        upscale=1,
-        arch='clean',
-        channel_multiplier=2,
-        device='cuda',
-    )
-
-    cap = cv2.VideoCapture(input_path)
-    fps = cap.get(cv2.CAP_PROP_FPS)
-    w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-    h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-
-    temp_video = output_path + '.tmp.avi'
-    fourcc = cv2.VideoWriter_fourcc(*'MJPG')
-    writer = cv2.VideoWriter(temp_video, fourcc, fps, (w, h))
-
-    count = 0
-    t0 = time.time()
-    while True:
-        ret, frame = cap.read()
-        if not ret:
-            break
-        _, _, enhanced = restorer.enhance(
-            frame, has_aligned=False, only_center_face=True, paste_back=True
-        )
-        writer.write(enhanced)
-        count += 1
-
-    cap.release()
-    writer.release()
-    enh_time = time.time() - t0
-
-    # Re-encode with h264 + mux audio from original
-    subprocess.run([
-        'ffmpeg', '-y',
-        '-i', temp_video, '-i', input_path,
-        '-map', '0:v', '-map', '1:a?',
-        '-c:v', 'libx264', '-crf', '18', '-preset', 'fast',
-        '-c:a', 'copy', '-pix_fmt', 'yuv420p',
-        output_path
-    ], capture_output=True, check=True)
-
-    os.remove(temp_video)
-    del restorer
-    torch.cuda.empty_cache()
-    return count, enh_time
-
-
 def handler(job):
     inp = job["input"]
     video_url = inp["video_url"]
@@ -129,7 +70,6 @@ def handler(job):
     steps    = int(inp.get("inference_steps", 20))
     guidance = float(inp.get("guidance_scale", 1.5))
     seed     = int(inp.get("seed", 1247))
-    enhance  = bool(inp.get("enhance", False))
 
     v_path = _normalize_path(rp_download.file(video_url))
     a_path = _normalize_path(rp_download.file(audio_url))
@@ -156,22 +96,12 @@ def handler(job):
     if not os.path.exists(out_path) or os.path.getsize(out_path) == 0:
         return {"error": "missing_output_file", "expected_path": out_path, "stderr": proc.stderr[-2000:]}
 
-    # Optional GFPGAN enhancement
-    enh_time = 0
-    if enhance and os.path.exists(GFPGAN_MODEL):
-        enhanced_path = out_path.replace('.mp4', '_enh.mp4')
-        _, enh_time = _enhance_video(out_path, enhanced_path)
-        os.remove(out_path)
-        out_path = enhanced_path
-
     try:
         result = _upload_to_r2(out_path)
     except Exception as e:
         return {"error": "upload_failed", "message": str(e)}
 
     rp_cleanup.clean()
-    result["enhanced"] = enhance
-    result["enhance_time"] = round(enh_time, 1)
     if proc.stdout:
         result["logs"] = proc.stdout[:2000]
     return result
